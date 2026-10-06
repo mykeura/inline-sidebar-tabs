@@ -17,6 +17,9 @@ const MARKER = 'data-inline-sidebar-tabs'
 const MIN_FREE_WIDTH = 120
 const TITLEBAR_HEIGHT = 34
 const TITLEBAR_DRAG_HANDLE_WIDTH = 48
+// apps/desktop/src/app/shell/titlebar.ts — fired when the window-chrome
+// clusters remount or move without resizing (route overlays, fullscreen).
+const TITLEBAR_CHROME_CHANGED_EVENT = 'hermes:titlebar-chrome-changed'
 
 const CSS = `
 /* Collapse the sidebar header back to the native titlebar height. */
@@ -125,6 +128,10 @@ export default {
 
     let frame = 0
     let disposed = false
+    // The elements the last sync measured against. Mutations elsewhere in the
+    // app (chat streaming touches the DOM constantly) must not force a layout
+    // read per frame — only structural changes below re-schedule a sync.
+    let observed = { group: null, left: null, right: null }
 
     const resizeObserver = new ResizeObserver(() => scheduleSync())
 
@@ -135,16 +142,19 @@ export default {
 
       const group = findSidebarGroup()
 
+      resizeObserver.disconnect()
+
       if (!group) {
+        observed = { group: null, left: null, right: null }
         clearMarkers()
-        resizeObserver.disconnect()
         return
       }
 
       const leftControls = document.querySelector('[data-titlebar-cluster="left"]')
       const rightControls = document.querySelector('[data-titlebar-cluster="right"]')
 
-      resizeObserver.disconnect()
+      observed = { group, left: leftControls, right: rightControls }
+
       resizeObserver.observe(group)
 
       if (leftControls instanceof HTMLElement) {
@@ -172,13 +182,36 @@ export default {
       frame = requestAnimationFrame(sync)
     }
 
-    const mutationObserver = new MutationObserver(scheduleSync)
+    const mutationObserver = new MutationObserver(() => {
+      if (disposed) {
+        return
+      }
+
+      // Structural check only — querySelector identity, no layout. A sync runs
+      // when the sidebar group remounts, the sessions tab moves to another
+      // group, or a titlebar cluster is replaced (route overlays swap the
+      // whole cluster set, which also invalidates the ResizeObserver targets).
+      const group = findSidebarGroup()
+
+      if (group === observed.group &&
+          document.querySelector('[data-titlebar-cluster="left"]') === observed.left &&
+          document.querySelector('[data-titlebar-cluster="right"]') === observed.right) {
+        return
+      }
+
+      scheduleSync()
+    })
     mutationObserver.observe(document.body, {
       childList: true,
       subtree: true
     })
 
-    ctx.addEventListener(window, 'resize', scheduleSync)
+    // `resize` is not redundant with the ResizeObserver: a fixed-width sidebar
+    // changes its free space when the window grows without the group or the
+    // clusters resizing (the right cluster only MOVES). The chrome event
+    // covers the position-only moves `resize` also misses (fullscreen).
+    window.addEventListener('resize', scheduleSync)
+    window.addEventListener(TITLEBAR_CHROME_CHANGED_EVENT, scheduleSync)
     scheduleSync()
 
     ctx.onDispose(() => {
@@ -186,6 +219,8 @@ export default {
       cancelAnimationFrame(frame)
       mutationObserver.disconnect()
       resizeObserver.disconnect()
+      window.removeEventListener('resize', scheduleSync)
+      window.removeEventListener(TITLEBAR_CHROME_CHANGED_EVENT, scheduleSync)
       clearMarkers()
       style.remove()
     })
